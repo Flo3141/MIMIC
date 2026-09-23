@@ -370,13 +370,6 @@ def main():
         help="Optional local path to weights directory containing config.json and model.safetensors",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        choices=["auto", "cuda", "cpu"],
-        help="Device to use for inference ('auto', 'cuda', 'cpu')",
-    )
-    parser.add_argument(
         "--batch_size",
         type=int,
         default=4,
@@ -405,6 +398,11 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine execution device: always prefer CUDA if available
+    selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device_str = f"CUDA ({torch.cuda.get_device_name(0)})" if selected_device == "cuda" else "CPU"
+
     print("=" * 75)
     print("        MIMIC Multimodal Embedding Pipeline for hIPSC_CM        ")
     print("=" * 75)
@@ -413,7 +411,7 @@ def main():
     print(f"Extraction Mode:       {args.mode.upper()}")
     print(f"MIMIC Version:         {args.model_version}")
     print(f"Local Weights:         {args.weights_dir or 'Hugging Face Hub (polymathic-ai/MIMIC)'}")
-    print(f"Device:                {args.device}")
+    print(f"Device:                {device_str}")
     print(f"Batch size:            {args.batch_size} (max {args.max_tokens_per_batch} tokens/batch)")
     print(f"Max sequence len:      {args.max_length}")
 
@@ -509,7 +507,7 @@ def main():
     model = load_pretrained(
         version=args.model_version,
         local_path=args.weights_dir,
-        device=args.device,
+        device=selected_device,
     )
     model.freeze_encoder(freeze_embeddings=True)
     model.eval()
