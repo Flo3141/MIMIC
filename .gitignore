@@ -20,3 +20,6 @@ venv/
 .uv/
 .ruff_cache/
 .pytest_cache/
+
+# Custom
+*.pdf
