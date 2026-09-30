@@ -26,6 +26,8 @@ import os
 import argparse
 import time
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 def print_header(title: str):
     print("\n" + "=" * 60)
     print(f"  {title}")
@@ -149,6 +151,7 @@ def test_model_inference(device: str, version: str, weights_dir: str = None):
 
         print_step(f"Loading pretrained MIMIC (version={version}, device={device}, weights_dir={weights_dir})")
         start_time = time.time()
+        reset_peak_memory_stats(device if device != "auto" else None)
         
         model = load_pretrained(version=version, local_path=weights_dir, device=device)
         load_time = time.time() - start_time
@@ -228,6 +231,9 @@ def main():
     print_header("SUMMARY")
     print(" [✓] All tested components are operational!")
     print(" MIMIC is successfully installed and ready to use.\n")
+
+    if not args.skip_model:
+        print_memory_profile(title="MIMIC TEST INSTALLATION SPEICHER-PROFILING")
 
 if __name__ == "__main__":
     main()

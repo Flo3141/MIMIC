@@ -45,6 +45,8 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from util import reset_peak_memory_stats, print_memory_profile
+
 # Ensure local mimic package is on sys.path if run from within repo or scripts dir
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -400,6 +402,7 @@ def main():
 
     # Determine execution device: always prefer CUDA if available
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    reset_peak_memory_stats(selected_device)
 
     device_str = f"CUDA ({torch.cuda.get_device_name(0)})" if selected_device == "cuda" else "CPU"
 
@@ -556,6 +559,8 @@ def main():
     print("\n" + "=" * 75)
     print(" [✓] All requested MIMIC embeddings successfully extracted and saved!")
     print("=" * 75)
+
+    print_memory_profile(device=selected_device, title="MIMIC EMBEDDINGS SPEICHER-PROFILING")
 
 
 if __name__ == "__main__":
