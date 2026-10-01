@@ -35,6 +35,10 @@ python scripts/extract_embeddings_hIPSC_CM.py --mode all --weights_dir /path/to/
 
 import os
 import sys
+
+# Prevent CUDA memory fragmentation by allowing PyTorch to allocate expandable virtual segments
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import time
 from pathlib import Path
@@ -75,10 +79,17 @@ def build_batches_by_length(
     samples: List[Dict],
     mode: str = "rna",
     batch_size: int = 4,
-    max_tokens_per_batch: int = 24000,
+    max_tokens_per_batch: int = 12000,
+    max_len_single_batch: int = 3500,
+    descending: bool = True,
 ) -> List[List[Dict]]:
     """
     Groups samples into batches by active sequence length to minimize padding waste.
+    For sequences >= max_len_single_batch, forces batch_size = 1 to prevent quadratic O(N^2)
+    VRAM explosion in MIMIC's mixed-attention mechanism.
+
+    If descending=True (default), batches the longest sequences first so that peak VRAM
+    usage is verified right at the beginning (Fail-Fast) before memory fragmentation occurs.
     """
     def sample_len(s: Dict) -> int:
         if mode == "rna":
@@ -89,7 +100,7 @@ def build_batches_by_length(
             return len(s["rna_seq"]) + (len(s["protein_seq"]) if s["has_cds"] else 0)
         return len(s["rna_seq"])
 
-    sorted_samples = sorted(samples, key=sample_len)
+    sorted_samples = sorted(samples, key=sample_len, reverse=descending)
 
     batches = []
     current_batch = []
@@ -97,10 +108,11 @@ def build_batches_by_length(
 
     for s in sorted_samples:
         s_len = max(1, sample_len(s))
+        effective_batch_limit = 1 if s_len >= max_len_single_batch else batch_size
         prospective_max_len = max(current_max_len, s_len)
         prospective_tokens = (len(current_batch) + 1) * prospective_max_len
 
-        if len(current_batch) >= batch_size or (current_batch and prospective_tokens > max_tokens_per_batch):
+        if len(current_batch) >= effective_batch_limit or (current_batch and prospective_tokens > max_tokens_per_batch):
             batches.append(current_batch)
             current_batch = [s]
             current_max_len = s_len
@@ -120,8 +132,13 @@ def extract_embeddings_for_mode(
     mode: str = "rna",
     include_cds: bool = False,
     batch_size: int = 4,
-    max_tokens_per_batch: int = 24000,
+    max_tokens_per_batch: int = 12000,
+    max_len_single_batch: int = 3500,
+    descending: bool = True,
     desc: str = None,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_interval: int = 500,
+    resume: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     Extracts MIMIC embeddings for a given mode ('rna', 'protein', or 'rna_protein').
@@ -162,6 +179,26 @@ def extract_embeddings_for_mode(
         raise ValueError(f"Unknown mode '{mode}'")
 
     emb_reg_mean = np.zeros((N, 1536), dtype=np.float32)
+    processed_mask = np.zeros(N, dtype=bool)
+
+    # Resume from intermediate checkpoint if available
+    if resume and checkpoint_path is not None and checkpoint_path.exists():
+        print(f"[*] Resuming from checkpoint: {checkpoint_path}")
+        try:
+            with np.load(checkpoint_path) as ckpt:
+                emb_primary = ckpt["embeddings"].copy()
+                emb_reg_mean = ckpt["embeddings_reg_mean"].copy()
+                if "embeddings_rna_mean" in ckpt and emb_rna_mean is not None:
+                    emb_rna_mean = ckpt["embeddings_rna_mean"].copy()
+                if "embeddings_prot_mean" in ckpt and emb_prot_mean is not None:
+                    emb_prot_mean = ckpt["embeddings_prot_mean"].copy()
+                if "processed_mask" in ckpt:
+                    processed_mask = ckpt["processed_mask"].copy()
+                else:
+                    processed_mask = (np.abs(emb_primary).sum(axis=1) > 0)
+            print(f"[*] Successfully restored {processed_mask.sum()}/{N} processed transcripts from checkpoint.")
+        except Exception as e:
+            print(f"[!] Warning: Failed to load checkpoint ({e}). Starting extraction from scratch.")
 
     # For protein mode, filter to coding samples only (cannot pass empty protein sequence)
     if mode == "protein":
@@ -169,14 +206,22 @@ def extract_embeddings_for_mode(
     else:
         active_samples = samples
 
-    batches = build_batches_by_length(
-        active_samples, mode=mode, batch_size=batch_size, max_tokens_per_batch=max_tokens_per_batch
-    )
+    remaining_samples = [s for s in active_samples if not processed_mask[s["orig_idx"]]]
+    print(f"Transcripts to process for mode '{mode}': {len(remaining_samples)} / {len(active_samples)}")
 
-    with torch.no_grad():
-        for batch in tqdm(batches, desc=desc):
+    if len(remaining_samples) > 0:
+        batches = build_batches_by_length(
+            remaining_samples,
+            mode=mode,
+            batch_size=batch_size,
+            max_tokens_per_batch=max_tokens_per_batch,
+            max_len_single_batch=max_len_single_batch,
+            descending=descending,
+        )
+
+        def _forward_and_record(sub_batch):
             model_batch = []
-            for item in batch:
+            for item in sub_batch:
                 inp = {}
                 if mode in ("rna", "rna_protein"):
                     inp["rna_seq"] = item["rna_seq"]
@@ -191,14 +236,14 @@ def extract_embeddings_for_mode(
 
                 model_batch.append(inp)
 
-            # Stage inputs and forward pass through frozen encoder
+            # Stage inputs and forward pass through frozen encoder (return_full=False saves VRAM)
             model.input(model_batch)
-            reps = model.embed(return_full=True, return_register=True, return_modality=True)
+            reps = model.embed(return_full=False, return_register=True, return_modality=True)
 
             register_tensor = reps["register"]  # [B, 5, 1536]
             modality_dict = reps["modality"]    # {b_idx: {group_name: Tensor}}
 
-            for b_idx, item in enumerate(batch):
+            for b_idx, item in enumerate(sub_batch):
                 orig_i = item["orig_idx"]
 
                 # Register representations
@@ -231,8 +276,51 @@ def extract_embeddings_for_mode(
                 elif mode == "rna_protein":
                     emb_primary[orig_i] = np.concatenate([reg_flat, rna_mean, prot_mean], axis=0)  # 10752
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                processed_mask[orig_i] = True
+
+        with torch.no_grad():
+            for b_num, batch in enumerate(tqdm(batches, desc=desc), start=1):
+                try:
+                    _forward_and_record(batch)
+                except torch.OutOfMemoryError as e:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if len(batch) > 1:
+                        print(f"\n[Warning] OOM with batch size {len(batch)}. Retrying samples individually...")
+                        for single_item in batch:
+                            try:
+                                _forward_and_record([single_item])
+                            except torch.OutOfMemoryError as e_single:
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                print(f"\n[Error] Single sequence (orig_idx={single_item['orig_idx']}, len={single_item.get('rna_len', '')}) caused OOM: {e_single}")
+                                raise e_single
+                    else:
+                        raise e
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Periodic checkpointing
+                if checkpoint_path is not None and checkpoint_interval > 0 and b_num % checkpoint_interval == 0:
+                    ckpt_dict = {
+                        "embeddings": emb_primary,
+                        "embeddings_reg_mean": emb_reg_mean,
+                        "processed_mask": processed_mask,
+                    }
+                    if emb_rna_mean is not None:
+                        ckpt_dict["embeddings_rna_mean"] = emb_rna_mean
+                    if emb_prot_mean is not None:
+                        ckpt_dict["embeddings_prot_mean"] = emb_prot_mean
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(checkpoint_path, **ckpt_dict)
+
+        # Remove temporary checkpoint file upon successful completion
+        if checkpoint_path is not None and checkpoint_path.exists():
+            try:
+                checkpoint_path.unlink()
+            except OSError:
+                pass
 
     result = {
         "embeddings": emb_primary,
@@ -380,8 +468,44 @@ def main():
     parser.add_argument(
         "--max_tokens_per_batch",
         type=int,
-        default=24000,
-        help="Max total tokens in a single batch to avoid VRAM overflow (default: 24000)",
+        default=12000,
+        help="Max total tokens in a single batch to avoid VRAM overflow (default: 12000)",
+    )
+    parser.add_argument(
+        "--max_len_single_batch",
+        type=int,
+        default=3500,
+        help="Sequence length threshold above which batch size is strictly capped at 1 (default: 3500)",
+    )
+    parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=500,
+        help="Interval of batches after which to save a checkpoint (default: 500)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from intermediate checkpoint or skip already generated files (default: True)",
+    )
+    parser.add_argument(
+        "--no_resume",
+        action="store_false",
+        dest="resume",
+        help="Do not resume, force re-computing from scratch",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        default=True,
+        help="Sort sequences from longest to shortest so that peak VRAM is tested immediately at the start (default: True)",
+    )
+    parser.add_argument(
+        "--ascending",
+        action="store_false",
+        dest="descending",
+        help="Sort sequences from shortest to longest (ascending order)",
     )
     parser.add_argument(
         "--max_length",
@@ -525,6 +649,19 @@ def main():
         print(f"   Executing Mode: {mode.upper()}")
         print("-" * 60)
 
+        # Determine output and checkpoint filenames
+        if args.output_filename and len(modes_to_run) == 1:
+            save_name = args.output_filename
+        else:
+            save_name = f"mimic_embeddings_hIPSC_CM_{mode}.npz"
+
+        out_file = output_dir / save_name
+        checkpoint_file = output_dir / f".ckpt_mimic_{mode}.npz"
+
+        if out_file.exists() and args.resume:
+            print(f"[*] Final archive '{out_file.name}' already exists. Skipping extraction (use --no_resume to overwrite).")
+            continue
+
         t_start = time.time()
         embs_dict = extract_embeddings_for_mode(
             samples=parsed_samples,
@@ -533,18 +670,16 @@ def main():
             include_cds=args.include_cds,
             batch_size=args.batch_size,
             max_tokens_per_batch=args.max_tokens_per_batch,
+            max_len_single_batch=args.max_len_single_batch,
+            descending=args.descending,
             desc=f"Extracting MIMIC Embeddings ({mode})",
+            checkpoint_path=checkpoint_file,
+            checkpoint_interval=args.checkpoint_interval,
+            resume=args.resume,
         )
         elapsed = time.time() - t_start
         print(f"Extraction for mode '{mode}' done in {elapsed:.2f}s ({elapsed / num_samples:.4f}s / sample).")
 
-        # Determine output filename
-        if args.output_filename and len(modes_to_run) == 1:
-            save_name = args.output_filename
-        else:
-            save_name = f"mimic_embeddings_hIPSC_CM_{mode}.npz"
-
-        out_file = output_dir / save_name
         save_embeddings_npz(
             output_path=out_file,
             embeddings_dict=embs_dict,
