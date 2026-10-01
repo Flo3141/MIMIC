@@ -137,8 +137,8 @@ def extract_embeddings_for_mode(
     descending: bool = True,
     desc: str = None,
     checkpoint_path: Optional[Path] = None,
-    checkpoint_interval: int = 500,
-    resume: bool = True,
+    checkpoint_interval: int = 200,
+    start_fresh: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Extracts MIMIC embeddings for a given mode ('rna', 'protein', or 'rna_protein').
@@ -181,9 +181,16 @@ def extract_embeddings_for_mode(
     emb_reg_mean = np.zeros((N, 1536), dtype=np.float32)
     processed_mask = np.zeros(N, dtype=bool)
 
-    # Resume from intermediate checkpoint if available
-    if resume and checkpoint_path is not None and checkpoint_path.exists():
-        print(f"[*] Resuming from checkpoint: {checkpoint_path}")
+    # Check for existing intermediate checkpoint unless --start_fresh is specified
+    if start_fresh:
+        if checkpoint_path is not None and checkpoint_path.exists():
+            try:
+                checkpoint_path.unlink()
+                print(f"[*] --start_fresh specified: removed existing checkpoint '{checkpoint_path.name}'.")
+            except Exception as e:
+                print(f"[!] Warning: Could not remove old checkpoint ({e}).")
+    elif checkpoint_path is not None and checkpoint_path.exists():
+        print(f"[*] Found existing checkpoint: {checkpoint_path}")
         try:
             with np.load(checkpoint_path) as ckpt:
                 emb_primary = ckpt["embeddings"].copy()
@@ -196,7 +203,7 @@ def extract_embeddings_for_mode(
                     processed_mask = ckpt["processed_mask"].copy()
                 else:
                     processed_mask = (np.abs(emb_primary).sum(axis=1) > 0)
-            print(f"[*] Successfully restored {processed_mask.sum()}/{N} processed transcripts from checkpoint.")
+            print(f"[*] Successfully restored {processed_mask.sum()}/{N} already computed transcripts from checkpoint.")
         except Exception as e:
             print(f"[!] Warning: Failed to load checkpoint ({e}). Starting extraction from scratch.")
 
@@ -278,42 +285,59 @@ def extract_embeddings_for_mode(
 
                 processed_mask[orig_i] = True
 
-        with torch.no_grad():
-            for b_num, batch in enumerate(tqdm(batches, desc=desc), start=1):
-                try:
-                    _forward_and_record(batch)
-                except torch.OutOfMemoryError as e:
+        def _save_checkpoint():
+            if checkpoint_path is None:
+                return
+            ckpt_dict = {
+                "embeddings": emb_primary,
+                "embeddings_reg_mean": emb_reg_mean,
+                "processed_mask": processed_mask,
+            }
+            if emb_rna_mean is not None:
+                ckpt_dict["embeddings_rna_mean"] = emb_rna_mean
+            if emb_prot_mean is not None:
+                ckpt_dict["embeddings_prot_mean"] = emb_prot_mean
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_ckpt = checkpoint_path.with_suffix(".tmp.npz")
+            np.savez_compressed(tmp_ckpt, **ckpt_dict)
+            tmp_ckpt.replace(checkpoint_path)
+
+        try:
+            with torch.no_grad():
+                for b_num, batch in enumerate(tqdm(batches, desc=desc), start=1):
+                    try:
+                        _forward_and_record(batch)
+                    except torch.OutOfMemoryError as e:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if len(batch) > 1:
+                            print(f"\n[Warning] OOM with batch size {len(batch)}. Retrying samples individually...")
+                            for single_item in batch:
+                                try:
+                                    _forward_and_record([single_item])
+                                except torch.OutOfMemoryError as e_single:
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    print(f"\n[Error] Single sequence (orig_idx={single_item['orig_idx']}, len={single_item.get('rna_len', '')}) caused OOM: {e_single}")
+                                    _save_checkpoint()
+                                    raise e_single
+                        else:
+                            _save_checkpoint()
+                            raise e
+
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    if len(batch) > 1:
-                        print(f"\n[Warning] OOM with batch size {len(batch)}. Retrying samples individually...")
-                        for single_item in batch:
-                            try:
-                                _forward_and_record([single_item])
-                            except torch.OutOfMemoryError as e_single:
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                print(f"\n[Error] Single sequence (orig_idx={single_item['orig_idx']}, len={single_item.get('rna_len', '')}) caused OOM: {e_single}")
-                                raise e_single
-                    else:
-                        raise e
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    # Periodic checkpointing
+                    if checkpoint_interval > 0 and b_num % checkpoint_interval == 0:
+                        _save_checkpoint()
 
-                # Periodic checkpointing
-                if checkpoint_path is not None and checkpoint_interval > 0 and b_num % checkpoint_interval == 0:
-                    ckpt_dict = {
-                        "embeddings": emb_primary,
-                        "embeddings_reg_mean": emb_reg_mean,
-                        "processed_mask": processed_mask,
-                    }
-                    if emb_rna_mean is not None:
-                        ckpt_dict["embeddings_rna_mean"] = emb_rna_mean
-                    if emb_prot_mean is not None:
-                        ckpt_dict["embeddings_prot_mean"] = emb_prot_mean
-                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                    np.savez_compressed(checkpoint_path, **ckpt_dict)
+        except (KeyboardInterrupt, SystemExit, Exception) as exc:
+            if checkpoint_path is not None:
+                print(f"\n[!] Execution stopped ({exc}). Saving latest progress to checkpoint '{checkpoint_path.name}'...")
+                _save_checkpoint()
+                print(f"[✓] Checkpoint saved successfully ({processed_mask.sum()}/{N} transcripts).")
+            raise exc
 
         # Remove temporary checkpoint file upon successful completion
         if checkpoint_path is not None and checkpoint_path.exists():
@@ -480,20 +504,14 @@ def main():
     parser.add_argument(
         "--checkpoint_interval",
         type=int,
-        default=500,
-        help="Interval of batches after which to save a checkpoint (default: 500)",
+        default=200,
+        help="Interval of batches after which to save an intermediate checkpoint (default: 200)",
     )
     parser.add_argument(
-        "--resume",
+        "--start_fresh",
         action="store_true",
-        default=True,
-        help="Resume from intermediate checkpoint or skip already generated files (default: True)",
-    )
-    parser.add_argument(
-        "--no_resume",
-        action="store_false",
-        dest="resume",
-        help="Do not resume, force re-computing from scratch",
+        default=False,
+        help="Ignore existing checkpoints or completed output files and force extraction from scratch",
     )
     parser.add_argument(
         "--descending",
@@ -658,9 +676,18 @@ def main():
         out_file = output_dir / save_name
         checkpoint_file = output_dir / f".ckpt_mimic_{mode}.npz"
 
-        if out_file.exists() and args.resume:
-            print(f"[*] Final archive '{out_file.name}' already exists. Skipping extraction (use --no_resume to overwrite).")
+        # Check if final completed embedding file already exists
+        if out_file.exists() and not args.start_fresh:
+            print(f"[*] Final archive '{out_file.name}' already exists. Skipping extraction. (Use --start_fresh to overwrite and recompute).")
             continue
+
+        if args.start_fresh:
+            if checkpoint_file.exists():
+                try:
+                    checkpoint_file.unlink()
+                    print(f"[*] --start_fresh active: Removed old checkpoint '{checkpoint_file.name}'.")
+                except Exception as e:
+                    print(f"[!] Warning: Could not remove old checkpoint ({e}).")
 
         t_start = time.time()
         embs_dict = extract_embeddings_for_mode(
@@ -675,7 +702,7 @@ def main():
             desc=f"Extracting MIMIC Embeddings ({mode})",
             checkpoint_path=checkpoint_file,
             checkpoint_interval=args.checkpoint_interval,
-            resume=args.resume,
+            start_fresh=args.start_fresh,
         )
         elapsed = time.time() - t_start
         print(f"Extraction for mode '{mode}' done in {elapsed:.2f}s ({elapsed / num_samples:.4f}s / sample).")
