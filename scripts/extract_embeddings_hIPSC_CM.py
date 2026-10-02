@@ -602,7 +602,8 @@ def main():
     # 2. Prepare sequences from precomputed Parquet
     print(f"\n[2/4] Reading precomputed sequences and proteins from '{data_path.name}'...")
     parsed_samples = []
-    truncated_count = 0
+    truncated_rna_count = 0
+    truncated_prot_count = 0
 
     for idx, row in tqdm(df.iterrows(), total=num_samples, desc="Loading precomputed sequences"):
         rna_seq = str(row["clean_rna_seq"]).strip()
@@ -612,20 +613,46 @@ def main():
             )
 
         orig_len = len(rna_seq)
-        if orig_len > args.max_length:
-            truncated_count += 1
-            rna_seq = rna_seq[: args.max_length]
-
         prot_seq = str(row["protein_seq_clean"]).strip() if pd.notna(row["protein_seq_clean"]) else ""
         if prot_seq.lower() in ("nan", "none"):
             prot_seq = ""
 
         has_cds = bool(row["has_cds"]) and len(prot_seq) > 0
+        cds_raw = str(row["cds"]).strip() if pd.notna(row["cds"]) else ""
 
-        # CDS binary track (used if --include_cds is set)
-        cds_mask = str(row["cds"]).strip() if pd.notna(row["cds"]) else ""
-        if len(cds_mask) > args.max_length:
-            cds_mask = cds_mask[: args.max_length]
+        if orig_len > args.max_length:
+            truncated_rna_count += 1
+            rna_seq = rna_seq[: args.max_length]
+
+            # Biologically synchronized truncation of protein sequence:
+            # Only retain codons whose 3 nucleotides lie completely within rna_seq[:args.max_length]
+            if has_cds and cds_raw:
+                codon_starts = [i for i, ch in enumerate(cds_raw) if ch == "1"]
+                valid_codons = sum(1 for pos in codon_starts if pos + 3 <= args.max_length)
+                if len(prot_seq) > valid_codons:
+                    truncated_prot_count += 1
+                    prot_seq = prot_seq[: valid_codons]
+                    has_cds = len(prot_seq) > 0
+            elif has_cds and len(prot_seq) > args.max_length:
+                truncated_prot_count += 1
+                prot_seq = prot_seq[: args.max_length]
+                has_cds = len(prot_seq) > 0
+
+            # CDS binary track (used if --include_cds is set)
+            cds_mask = cds_raw[: args.max_length]
+            if cds_mask:
+                cds_chars = list(cds_mask)
+                # Clear any codon start marker cut off within the last 2 nucleotides
+                for pos in range(max(0, args.max_length - 2), len(cds_chars)):
+                    if cds_chars[pos] == "1":
+                        cds_chars[pos] = "0"
+                cds_mask = "".join(cds_chars)
+        else:
+            if has_cds and len(prot_seq) > args.max_length:
+                truncated_prot_count += 1
+                prot_seq = prot_seq[: args.max_length]
+                has_cds = len(prot_seq) > 0
+            cds_mask = cds_raw
 
         parsed_samples.append({
             "orig_idx": idx,
@@ -638,8 +665,10 @@ def main():
             "prot_len": len(prot_seq),
         })
 
-    if truncated_count > 0:
-        print(f"Notice: {truncated_count} transcripts exceeded {args.max_length} nt and were truncated.")
+    if truncated_rna_count > 0:
+        print(f"Notice: {truncated_rna_count} transcripts exceeded {args.max_length} nt and were truncated.")
+    if truncated_prot_count > 0:
+        print(f"Notice: {truncated_prot_count} corresponding protein sequences were truncated to match the RNA window.")
 
     coding_count = sum(1 for s in parsed_samples if s["has_cds"])
     print(f"Total transcripts:         {num_samples}")
