@@ -207,6 +207,7 @@ def train_and_evaluate_mode(
     has_cds = data.get("has_cds")
 
     # 1. Filter invalid target values (NaN / Inf) and unencoded / all-zero embeddings
+    # All Zero Embeddings: If we have a non protein coding RNA, then we do not have a protein sequence --> would skew the results
     valid_target = ~np.isnan(y) & ~np.isinf(y)
     valid_emb = np.any(X != 0, axis=1)
     valid_mask = valid_target & valid_emb
